@@ -148,7 +148,7 @@ def generate_image(pipeline, prompt, num_inference_steps=50, guidance_scale=7.5)
 
 
 # Path to your fine-tuned LoRA weights
-LORA_WEIGHTS_PATH = "./lora_weights/fine_tuned_lora_light.pt"
+LORA_WEIGHTS_PATH = "./lora_weights/fine_tuned_lora.pt"
 
 # Load the fine-tuned pipeline
 pipeline = load_finetuned_pipeline(LORA_WEIGHTS_PATH)

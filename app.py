@@ -7,6 +7,8 @@ from diffusers import StableDiffusionPipeline
 from torch import nn
 import torchvision.transforms as transforms
 from transformers import CLIPTextModel, CLIPTokenizer
+from torch.utils.tensorboard import SummaryWriter
+import torch.nn.init as init
 
 # Define directories for saving images and LoRA weights
 IMAGES_PATH = "./uploaded_images/"
@@ -31,8 +33,12 @@ class LoRALayer(nn.Module):
         """Dynamically initialize LoRA layers based on input features."""
         self.lora_down = nn.Linear(in_features, self.rank, bias=False).to(device)
         self.lora_up = nn.Linear(self.rank, out_features, bias=False).to(device)
+
+        init.xavier_uniform_(self.lora_down.weight)
+        init.xavier_uniform_(self.lora_up.weight)
         if in_features != out_features:
             self.projection = nn.Linear(in_features, out_features, bias=False).to(device)
+            init.xavier_uniform_(self.projection.weight)
 
     def forward(self, x):
         # Initialize layers dynamically based on input shape if not already initialized
@@ -147,58 +153,110 @@ def debug_lora_weights(state_dict):
         else:
             print(f"  Shape: {layer_params.shape}")
 
-# Fine-tune model with DreamBooth and LoRA
-def fine_tune_with_dreambooth(pipeline, images, num_steps=20):
-    print("\n=== Fine-Tuning with DreamBooth ===")
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, pipeline.unet.parameters()), lr=5e-5)
+def gradient_descent(pipeline, image_tensor, optimizer, step):
+    with torch.no_grad():
+        image_latents = pipeline.vae.encode(image_tensor).latent_dist.sample().to(device)
+        image_latents = image_latents * pipeline.vae.config.scaling_factor
 
-    # Freeze all layers except LoRA layers
+    image_latents = image_latents.to(device).to(torch.float32)
+    noise = torch.randn_like(image_latents, device=device)
+    noise = noise.to(torch.float32)
+    timesteps = torch.randint(0, pipeline.scheduler.config.num_train_timesteps, (1,), device=device).long()
+    noisy_image = pipeline.scheduler.add_noise(image_latents, noise, timesteps)
+
+    # Tokenize and encode text
+    text_inputs = pipeline.tokenizer("An image of Divyang", return_tensors="pt").to(device)
+    encoder_hidden_states = pipeline.text_encoder(text_inputs.input_ids).last_hidden_state.to(device)
+
+    output = pipeline.unet(noisy_image, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+
+    loss = torch.nn.functional.mse_loss(output, noise)
+    before_training = {}
+    for name, param in pipeline.unet.named_parameters():
+        if param.requires_grad:
+            before_training[name] = param.clone().detach()
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(pipeline.unet.parameters(), max_norm=1.0)
+    optimizer.step()
+    optimizer.zero_grad()
+
+    for name, param in pipeline.unet.named_parameters():
+        if param.requires_grad and param.grad is not None:
+            writer.add_histogram(f"{name}_grad", param.grad, global_step=step)
+
+    return loss
+
+
+# Fine-tune model with DreamBooth and LoRA
+def fine_tune_with_dreambooth(pipeline, images, num_steps=15):
+    dummy_input = preprocess_image(images[0]).to(device).to(torch.float32)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, pipeline.unet.parameters()), lr=1e-5)
+    gradient_descent(pipeline, dummy_input, optimizer, 0)
+
+    print("\n=== Fine-Tuning with DreamBooth ===")
+    # Freeze all layers
     for param in pipeline.unet.parameters():
         param.requires_grad = False
+
+    # Unfreeze LoRA layers
     for name, module in pipeline.unet.named_modules():
         if isinstance(module, LoRALayer):
-            for param in module.parameters():
+            for name, param in module.named_parameters():
                 param.requires_grad = True
 
+    # for name, param in pipeline.unet.named_parameters():
+    #     if param.requires_grad:
+    #         print(f"Trainable parameter: {name}, Shape: {param.shape}")
+
     pipeline.unet.train()
+    augmentation_transform_1 = transforms.Compose([
+        transforms.RandomHorizontalFlip(),  # Randomly flip horizontally
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),  # Random color jitter
+        transforms.Resize((512, 512)),  # Resize to desired input size
+        transforms.ToTensor(),  # Convert to tensor
+        transforms.Normalize([0.5], [0.5])
+    ])
+
+    augmentation_transform_2 = transforms.Compose([
+        transforms.RandomVerticalFlip(),  # Randomly flip vertically
+        transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),  # Random affine transformations
+        transforms.Resize((512, 512)),  # Resize to desired input size
+        transforms.ToTensor(),  # Convert to tensor
+        transforms.Normalize([0.5], [0.5])
+    ])
+
+    augmentation_transform_3 = transforms.Compose([
+        transforms.RandomRotation(30),  # Randomly rotate images by 30 degrees
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),  # Random color jitter
+        transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),  # Random affine transformations
+        transforms.Resize((512, 512)),  # Resize to desired input size
+        transforms.ToTensor(),  # Convert to tensor
+        transforms.Normalize([0.5], [0.5])
+    ])
+
     for step in range(num_steps):
         loss_sum = 0
-        for image in images:
-            image_tensor = preprocess_image(image).to(device).to(torch.float32) # Move to GPU
-
-            with torch.no_grad():
-                image_latents = pipeline.vae.encode(image_tensor).latent_dist.sample().to(device)
-                image_latents = image_latents * pipeline.vae.config.scaling_factor
-
-            image_latents = image_latents.to(device).to(torch.float32)
-            noise = torch.randn_like(image_latents, device=device)
-            noise = noise.to(torch.float32)
-            timesteps = torch.randint(0, pipeline.scheduler.config.num_train_timesteps, (1,), device=device).long()
-            noisy_image = pipeline.scheduler.add_noise(image_latents, noise, timesteps)
-
-            # Tokenize and encode text
-            text_inputs = pipeline.tokenizer("An image of Divyang", return_tensors="pt").to(device)
-            encoder_hidden_states = pipeline.text_encoder(text_inputs.input_ids).last_hidden_state.to(device)
-
-            output = pipeline.unet(noisy_image, timesteps, encoder_hidden_states=encoder_hidden_states).sample
-
-            loss = torch.nn.functional.mse_loss(output, noise)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-
-            print(f"Step [{step}/{num_steps}], Loss: {loss.item()}")
-            loss_sum += loss.item()
+        for im in images:
+            image_tensor = preprocess_image(im).to(device).to(torch.float32) # Move to GPU
+            image_tensor_1 = augmentation_transform_1(im).unsqueeze(0).to(device).to(torch.float32)
+            # image_tensor_2 = augmentation_transform_2(im).unsqueeze(0).to(device).to(torch.float32)
+            # image_tensor_3 = augmentation_transform_3(im).unsqueeze(0).to(device).to(torch.float32)
+            # augmented_images = [image_tensor, image_tensor_1, image_tensor_2, image_tensor_3]
+            augmented_images = [image_tensor, image_tensor_1]
+            for image_tensor in augmented_images:
+                loss = gradient_descent(pipeline, image_tensor, optimizer, step)
+                loss_sum += loss.item()
+                print(f"Step [{step}/{num_steps}], Loss: {loss.item()}")
 
         # Calculate average loss
         avg_loss = loss_sum / len(images)
-        if step > 5:
-            generated_image = generate_image(pipeline, "An image of Divyang")
-
-            # Save generated image
-            generated_image_path = os.path.join(GENERATED_IMAGES_PATH, f"generated_image_{step}.png")
-            generated_image.save(generated_image_path)
         print(f"Step [{step}/{num_steps}], Average Loss: {avg_loss}")
+        generated_image = generate_image(pipeline, "An image of Divyang sitting on the beach", guidance_scale=10)
+
+        # Save generated image
+        generated_image_path = os.path.join(GENERATED_IMAGES_PATH, f"generated_image_{step}.png")
+        generated_image.save(generated_image_path)
 
     # Save the LoRA weights
     lora_weights_path = os.path.join(LORA_WEIGHTS_PATH, "fine_tuned_lora.pt")
@@ -213,6 +271,7 @@ def fine_tune_with_dreambooth(pipeline, images, num_steps=20):
 st.title("DreamBooth Fine-Tuning with LoRA")
 device = "cpu" if torch.backends.mps.is_available() else "cpu"
 print(f"Using device: {device}")
+writer = SummaryWriter()
 uploaded_files = st.file_uploader("Upload 10 images", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
 
 if len(uploaded_files) == 10:
